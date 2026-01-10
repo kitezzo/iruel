@@ -21,6 +21,8 @@ extern int getgid(void);
 extern int open(const char *path, int flags);
 extern int close(int fd);
 extern int readdir(int fd, void *dent);
+extern int pipe(int fds[2]);
+extern int dup2(int oldfd, int newfd);
 
 #define O_RDONLY    0x0000
 #define O_WRONLY    0x0001
@@ -48,27 +50,127 @@ struct dirent {
     char name[NAME_MAX];
 };
 
+#define REDIR_NONE   0
+#define REDIR_INPUT  1
+#define REDIR_OUTPUT 2
+#define REDIR_APPEND 3
+
+struct command {
+    char *argv[MAX_ARGS];
+    int argc;
+    int in_type;
+    char *in_file;
+    int out_type;
+    char *out_file;
+};
+
+#define MAX_CMDS 8
+struct pipeline {
+    struct command cmds[MAX_CMDS];
+    int ncmds;
+};
+
+static int is_meta(char c) {
+    return c == '|' || c == '>' || c == '<';
+}
+
 static int tokenize(char *line, char *tokens[]) {
     int count = 0;
     char *p = line;
 
     while (*p && count < MAX_TOKENS - 1) {
-        while (*p == ' ' || *p == '\t') {
-            p++;
-        }
+        while (*p == ' ' || *p == '\t') p++;
         if (*p == '\0') break;
 
         tokens[count++] = p;
-        while (*p && *p != ' ' && *p != '\t') {
+
+        if (p[0] == '>' && p[1] == '>') {
+            p += 2;
+        } else if (is_meta(*p)) {
             p++;
+        } else {
+            while (*p && *p != ' ' && *p != '\t' && !is_meta(*p)) {
+                if (p[0] == '>' && p[1] == '>') break;
+                p++;
+            }
         }
-        if (*p) {
+
+        if (*p && (*p == ' ' || *p == '\t')) {
             *p++ = '\0';
         }
     }
 
     tokens[count] = 0;
     return count;
+}
+
+static int parse_pipeline(char *tokens[], int ntokens, struct pipeline *pl) {
+    memset(pl, 0, sizeof(*pl));
+    if (ntokens == 0) return 0;
+
+    int cmd_idx = 0;
+    int arg_idx = 0;
+    struct command *cmd = &pl->cmds[0];
+
+    for (int i = 0; i < ntokens; i++) {
+        char *tok = tokens[i];
+
+        if (strcmp(tok, "|") == 0) {
+            if (arg_idx == 0) {
+                printf("sh: syntax error near '|'\n");
+                return -1;
+            }
+            cmd->argv[arg_idx] = 0;
+            cmd->argc = arg_idx;
+            cmd_idx++;
+            if (cmd_idx >= MAX_CMDS) {
+                printf("sh: too many commands in pipeline\n");
+                return -1;
+            }
+            cmd = &pl->cmds[cmd_idx];
+            arg_idx = 0;
+        } else if (strcmp(tok, "<") == 0) {
+            if (i + 1 >= ntokens || !tokens[i + 1] || is_meta(tokens[i + 1][0])) {
+                printf("sh: syntax error near '<'\n");
+                return -1;
+            }
+            cmd->in_type = REDIR_INPUT;
+            cmd->in_file = tokens[++i];
+        } else if (strcmp(tok, ">>") == 0) {
+            if (i + 1 >= ntokens || !tokens[i + 1] || is_meta(tokens[i + 1][0])) {
+                printf("sh: syntax error near '>>'\n");
+                return -1;
+            }
+            cmd->out_type = REDIR_APPEND;
+            cmd->out_file = tokens[++i];
+        } else if (strcmp(tok, ">") == 0) {
+            if (i + 1 >= ntokens || !tokens[i + 1] || is_meta(tokens[i + 1][0])) {
+                printf("sh: syntax error near '>'\n");
+                return -1;
+            }
+            cmd->out_type = REDIR_OUTPUT;
+            cmd->out_file = tokens[++i];
+        } else {
+            if (arg_idx >= MAX_ARGS - 1) {
+                printf("sh: too many arguments\n");
+                return -1;
+            }
+            cmd->argv[arg_idx++] = tok;
+        }
+    }
+
+    if (arg_idx == 0) {
+        if (cmd_idx > 0) {
+            printf("sh: syntax error at end of pipeline\n");
+            return -1;
+        }
+        return 0;
+    }
+
+    cmd->argv[arg_idx] = 0;
+    cmd->argc = arg_idx;
+    pl->ncmds = cmd_idx + 1;
+    return 0;
 }
 
 static int builtin_exit(int argc, char *argv[]) {
@@ -223,6 +325,156 @@ static int run_builtin(char *argv[], int argc) {
     return 1;
 }
 
+static void build_path(const char *cmd, char *path) {
+    if (cmd[0] == '/') {
+        strcpy(path, cmd);
+    } else {
+        strcpy(path, "/bin/");
+        strcpy(path + 5, cmd);
+    }
+}
+
+static int setup_redir(struct command *cmd) {
+    if (cmd->in_type == REDIR_INPUT) {
+        int fd = open(cmd->in_file, O_RDONLY);
+        if (fd < 0) {
+            printf("sh: cannot open %s\n", cmd->in_file);
+            return -1;
+        }
+        dup2(fd, 0);
+        close(fd);
+    }
+    if (cmd->out_type == REDIR_OUTPUT) {
+        int fd = open(cmd->out_file, O_WRONLY | O_CREAT | O_TRUNC);
+        if (fd < 0) {
+            printf("sh: cannot create %s\n", cmd->out_file);
+            return -1;
+        }
+        dup2(fd, 1);
+        close(fd);
+    } else if (cmd->out_type == REDIR_APPEND) {
+        int fd = open(cmd->out_file, O_WRONLY | O_CREAT | O_APPEND);
+        if (fd < 0) {
+            printf("sh: cannot open %s\n", cmd->out_file);
+            return -1;
+        }
+        dup2(fd, 1);
+        close(fd);
+    }
+    return 0;
+}
+
+static int run_pipeline(struct pipeline *pl) {
+    if (pl->ncmds == 0) return 0;
+
+    if (pl->ncmds == 1) {
+        struct command *cmd = &pl->cmds[0];
+
+        if (is_builtin(cmd->argv[0]) &&
+            cmd->in_type == REDIR_NONE && cmd->out_type == REDIR_NONE) {
+            return run_builtin(cmd->argv, cmd->argc);
+        }
+
+        int pid = fork();
+        if (pid < 0) {
+            puts("sh: fork failed");
+            return -1;
+        }
+        if (pid == 0) {
+            if (cmd->in_type != REDIR_NONE || cmd->out_type != REDIR_NONE) {
+                if (setup_redir(cmd) < 0) exit(1);
+            }
+            if (is_builtin(cmd->argv[0])) {
+                int ret = run_builtin(cmd->argv, cmd->argc);
+                exit(ret);
+            }
+            char path[MAX_LINE];
+            build_path(cmd->argv[0], path);
+            execve(path, cmd->argv, 0);
+            printf("sh: %s: command not found\n", cmd->argv[0]);
+            exit(127);
+        }
+        int status;
+        waitpid(pid, &status, 0);
+        return status;
+    }
+
+    int pids[MAX_CMDS];
+    int prev_fd = -1;
+
+    for (int i = 0; i < pl->ncmds; i++) {
+        struct command *cmd = &pl->cmds[i];
+        int pipefd[2] = {-1, -1};
+
+        if (i < pl->ncmds - 1) {
+            if (pipe(pipefd) < 0) {
+                puts("sh: pipe failed");
+                return -1;
+            }
+        }
+
+        int pid = fork();
+        if (pid < 0) {
+            puts("sh: fork failed");
+            return -1;
+        }
+
+        if (pid == 0) {
+            if (prev_fd >= 0) {
+                dup2(prev_fd, 0);
+                close(prev_fd);
+            }
+            if (pipefd[1] >= 0) {
+                dup2(pipefd[1], 1);
+                close(pipefd[0]);
+                close(pipefd[1]);
+            }
+            if (i == 0 && cmd->in_type != REDIR_NONE) {
+                int fd = open(cmd->in_file, O_RDONLY);
+                if (fd < 0) {
+                    printf("sh: cannot open %s\n", cmd->in_file);
+                    exit(1);
+                }
+                dup2(fd, 0);
+                close(fd);
+            }
+            if (i == pl->ncmds - 1 && cmd->out_type != REDIR_NONE) {
+                int flags = O_WRONLY | O_CREAT;
+                flags |= (cmd->out_type == REDIR_APPEND) ? O_APPEND : O_TRUNC;
+                int fd = open(cmd->out_file, flags);
+                if (fd < 0) {
+                    printf("sh: cannot open %s\n", cmd->out_file);
+                    exit(1);
+                }
+                dup2(fd, 1);
+                close(fd);
+            }
+            if (is_builtin(cmd->argv[0])) {
+                int ret = run_builtin(cmd->argv, cmd->argc);
+                exit(ret);
+            }
+            char path[MAX_LINE];
+            build_path(cmd->argv[0], path);
+            execve(path, cmd->argv, 0);
+            printf("sh: %s: command not found\n", cmd->argv[0]);
+            exit(127);
+        }
+
+        pids[i] = pid;
+        if (prev_fd >= 0) close(prev_fd);
+        if (pipefd[1] >= 0) close(pipefd[1]);
+        prev_fd = pipefd[0];
+    }
+
+    int last_status = 0;
+    for (int i = 0; i < pl->ncmds; i++) {
+        int status;
+        waitpid(pids[i], &status, 0);
+        if (i == pl->ncmds - 1) last_status = status;
+    }
+    return last_status;
+}
+
 int main(int argc, char *argv[], char *envp[]) {
     (void)argc;
     (void)argv;
@@ -230,61 +482,26 @@ int main(int argc, char *argv[], char *envp[]) {
 
     char line[MAX_LINE];
     char *tokens[MAX_TOKENS];
+    struct pipeline pl;
 
-    puts("iruel shell v0.1");
+    puts("iruel shell v0.2");
     puts("type 'help' for available commands.\n");
 
     while (1) {
         write(1, "# ", 2);
 
         int64_t n = read(0, line, MAX_LINE - 1);
-        if (n <= 0) {
-            break;
-        }
-        if (n > 0 && line[n - 1] == '\n') {
-            n--;
-        }
+        if (n <= 0) break;
+        if (n > 0 && line[n - 1] == '\n') n--;
         line[n] = '\0';
 
         int ntokens = tokenize(line, tokens);
         if (ntokens == 0) continue;
 
-        tokens[ntokens] = 0;
+        if (parse_pipeline(tokens, ntokens, &pl) < 0) continue;
+        if (pl.ncmds == 0) continue;
 
-    if (is_builtin(tokens[0])) {
-        run_builtin(tokens, ntokens);
-        continue;
-    }
-
-        char path[MAX_LINE];
-        if (tokens[0][0] == '/') {
-            strcpy(path, tokens[0]);
-        } else {
-            strcpy(path, "/bin/");
-            strcpy(path + 5, tokens[0]);
-        }
-
-        int check = open(path, O_RDONLY);
-        if (check < 0) {
-            printf("sh: %s: command not found\n", tokens[0]);
-            continue;
-        }
-        close(check);
-
-        int pid = fork();
-        if (pid < 0) {
-            puts("sh: fork failed");
-            continue;
-        }
-
-        if (pid == 0) {
-            execve(path, tokens, 0);
-            printf("sh: %s: command not found\n", tokens[0]);
-            exit(127);
-        }
-
-        int status;
-        waitpid(pid, &status, 0);
+        run_pipeline(&pl);
     }
 
     puts("exit");
